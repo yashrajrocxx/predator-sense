@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Predator Control
+GenericName=Keyboard RGB control
+Comment=Control keyboard RGB and system settings for Acer Predator laptops
+Exec=predator keyboard
+Icon=preferences-desktop-keyboard
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=predator;keyboard;rgb;laptop;acer;
