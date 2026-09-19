@@ -275,15 +275,18 @@ fi
 sudo usermod -aG "$MODULE" "$USER"
 
 # Rebuild the tmpfiles policy from scratch so stale entries cannot accumulate.
+# Use type 'z' (adjust mode/ownership). Type 'f' would try to create sysfs
+# files; type 'm' is invalid on systemd 261+ and silently ignored.
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"; kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true' EXIT
 
 {
     for f in backlight_timeout battery_calibration battery_limiter boot_animation_sound fan_speed lcd_override usb_charging; do
-        printf 'f %s/%s 0660 root %s\n' "$PREDATOR_BASE" "$f" "$MODULE"
+        printf 'z %s/%s 0664 root %s -\n' "$PREDATOR_BASE" "$f" "$MODULE"
     done
-    printf 'f %s/four_zone_mode 0660 root %s\n' "$KB_BASE" "$MODULE"
-    printf 'f %s/per_zone_mode 0660 root %s\n' "$KB_BASE" "$MODULE"
+    printf 'z %s/four_zone_mode 0664 root %s -\n' "$KB_BASE" "$MODULE"
+    printf 'z %s/per_zone_mode 0664 root %s -\n' "$KB_BASE" "$MODULE"
+    printf 'z /sys/firmware/acpi/platform_profile 0664 root %s -\n' "$MODULE"
 } > "$tmp"
 
 sudo install -m 644 "$tmp" "$TMPFILES_FILE"

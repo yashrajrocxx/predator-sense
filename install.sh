@@ -181,21 +181,23 @@ setup_group() {
 }
 
 setup_tmpfiles() {
-    # Apply chmod to sysfs nodes so the CLI can read without sudo.
-    # Write access still requires linuwu_sense group membership.
+    # Use type 'z' (adjust mode/ownership). Type 'm' is invalid on
+    # systemd 261+ and is silently ignored, leaving nodes at 644
+    # root:root with no group write. Type 'f' would try to create
+    # sysfs files instead of adjusting them.
     local rules
     rules=$(cat <<'EOF'
-# Predator Control - read access to linuwu_sense sysfs nodes
-m /sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense/fan_speed 0664 root linuwu_sense -
-m /sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense/battery_limiter 0664 root linuwu_sense -
-m /sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense/battery_calibration 0664 root linuwu_sense -
-m /sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense/boot_animation_sound 0664 root linuwu_sense -
-m /sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense/lcd_override 0664 root linuwu_sense -
-m /sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense/usb_charging 0664 root linuwu_sense -
-m /sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense/backlight_timeout 0664 root linuwu_sense -
-m /sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/four_zoned_kb/four_zone_mode 0664 root linuwu_sense -
-m /sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/four_zoned_kb/per_zone_mode 0664 root linuwu_sense -
-m /sys/firmware/acpi/platform_profile 0664 root linuwu_sense -
+# Predator Control - group write access to linuwu_sense sysfs nodes (type z = adjust mode/ownership)
+z /sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense/fan_speed 0664 root linuwu_sense -
+z /sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense/battery_limiter 0664 root linuwu_sense -
+z /sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense/battery_calibration 0664 root linuwu_sense -
+z /sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense/boot_animation_sound 0664 root linuwu_sense -
+z /sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense/lcd_override 0664 root linuwu_sense -
+z /sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense/usb_charging 0664 root linuwu_sense -
+z /sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense/backlight_timeout 0664 root linuwu_sense -
+z /sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/four_zoned_kb/four_zone_mode 0664 root linuwu_sense -
+z /sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/four_zoned_kb/per_zone_mode 0664 root linuwu_sense -
+z /sys/firmware/acpi/platform_profile 0664 root linuwu_sense -
 EOF
 )
     echo "$rules" | sudo tee "$TMPFILES_FILE" >/dev/null
@@ -204,6 +206,65 @@ EOF
     sudo systemd-tmpfiles --create "$TMPFILES_FILE" >/dev/null 2>&1 && {
         say "    tmpfiles rules applied"
     } || warn "    systemd-tmpfiles reported a warning (non-fatal)"
+}
+
+# ── Stage 6b: boot-robust permissions ────────────────────────────────
+# tmpfiles runs before the module loads at boot, so driver nodes don't
+# exist yet. This helper + service + udev rule re-applies group write
+# after the module appears.
+setup_perm_fix() {
+    say "Installing boot permission fix ..."
+    sudo tee /usr/local/bin/predator-permissions-fix >/dev/null <<'EOF'
+#!/usr/bin/env bash
+# Re-apply linuwu_sense sysfs group permissions (runs at boot after module load,
+# and can be run manually after modprobe).
+set -u
+GROUP="linuwu_sense"
+FILES=(
+  "/sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense/fan_speed"
+  "/sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense/battery_limiter"
+  "/sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense/battery_calibration"
+  "/sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense/boot_animation_sound"
+  "/sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense/lcd_override"
+  "/sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense/usb_charging"
+  "/sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/predator_sense/backlight_timeout"
+  "/sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/four_zoned_kb/four_zone_mode"
+  "/sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi/four_zoned_kb/per_zone_mode"
+  "/sys/firmware/acpi/platform_profile"
+)
+for f in "${FILES[@]}"; do
+  if [[ -e "$f" ]]; then
+    chgrp "$GROUP" "$f" 2>/dev/null || true
+    chmod 0664 "$f" 2>/dev/null || true
+  fi
+done
+systemd-tmpfiles --create /etc/tmpfiles.d/predator-control.conf 2>/dev/null || true
+systemd-tmpfiles --create /etc/tmpfiles.d/linuwu_sense.conf 2>/dev/null || true
+EOF
+    sudo chmod 755 /usr/local/bin/predator-permissions-fix
+    sudo tee /etc/systemd/system/predator-permissions.service >/dev/null <<'EOF'
+[Unit]
+Description=Fix linuwu_sense sysfs permissions for linuwu_sense group
+After=systemd-modules-load.service systemd-tmpfiles-setup.service
+Wants=systemd-modules-load.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/predator-permissions-fix
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo tee /etc/udev/rules.d/99-predator-control.rules >/dev/null <<'EOF'
+# Predator Control - grant linuwu_sense group write access on driver sysfs nodes
+SUBSYSTEM=="platform", DRIVER=="acer-wmi", RUN+="/usr/local/bin/predator-permissions-fix"
+ACTION=="add", SUBSYSTEM=="firmware", RUN+="/usr/local/bin/predator-permissions-fix"
+EOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable predator-permissions.service >/dev/null 2>&1 || true
+    sudo systemctl start predator-permissions.service >/dev/null 2>&1 || true
+    sudo udevadm control --reload-rules 2>/dev/null || true
+    sudo /usr/local/bin/predator-permissions-fix 2>/dev/null || true
+    say "    boot permission fix installed"
 }
 
 setup_sudoers() {
@@ -287,6 +348,7 @@ main() {
     install_launcher
     setup_group
     setup_tmpfiles
+    setup_perm_fix
     setup_sudoers
     install_desktop
     verify

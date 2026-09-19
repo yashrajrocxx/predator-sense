@@ -24,8 +24,12 @@ class UninstallPathTests(unittest.TestCase):
         self.assertEqual(predator.APP_INSTALLABLE_PATHS, [
             "/opt/predator-control",
             "/usr/local/bin/predator",
+            "/usr/local/bin/predator-permissions-fix",
             "/usr/share/applications/predator.desktop",
             "/etc/tmpfiles.d/predator-control.conf",
+            "/etc/tmpfiles.d/linuwu_sense.conf",
+            "/etc/udev/rules.d/99-predator-control.rules",
+            "/etc/systemd/system/predator-permissions.service",
             "/etc/sudoers.d/predator-control",
         ])
 
@@ -77,10 +81,12 @@ def _verify_exists(_self):
 
 
 class UninstallCliTests(unittest.TestCase):
+    @mock.patch.object(predator.subprocess, "run",
+                       return_value=MockCompleted())
     @mock.patch.object(predator, "_uninstall_paths", return_value=(True, []))
     @mock.patch.object(Path, "exists", autospec=True, side_effect=_collect_exists)
     @mock.patch.object(Path, "is_symlink", return_value=True)
-    def test_yes_removes_paths(self, _symlink, _exists, _uninstall):
+    def test_yes_removes_paths(self, _symlink, _exists, _uninstall, _run):
         with mock.patch("builtins.input") as fake_input:
             predator.cmd_uninstall(["--yes"])
             fake_input.assert_not_called()
@@ -96,10 +102,12 @@ class UninstallCliTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 0)
         uninstall.assert_not_called()
 
+    @mock.patch.object(predator.subprocess, "run",
+                       return_value=MockCompleted())
     @mock.patch.object(predator, "_uninstall_paths", return_value=(True, []))
     @mock.patch.object(Path, "exists", autospec=True, side_effect=_collect_exists)
     @mock.patch.object(Path, "is_symlink", return_value=True)
-    def test_answer_yes_runs(self, _symlink, _exists, _uninstall):
+    def test_answer_yes_runs(self, _symlink, _exists, _uninstall, _run):
         with mock.patch("builtins.input", return_value="yes"):
             predator.cmd_uninstall([])
         _uninstall.assert_called_once()

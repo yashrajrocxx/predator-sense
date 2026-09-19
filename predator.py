@@ -1076,8 +1076,12 @@ def launch_gui(selftest: bool = False):
 APP_INSTALLABLE_PATHS = [
     "/opt/predator-control",
     "/usr/local/bin/predator",
+    "/usr/local/bin/predator-permissions-fix",
     "/usr/share/applications/predator.desktop",
     "/etc/tmpfiles.d/predator-control.conf",
+    "/etc/tmpfiles.d/linuwu_sense.conf",
+    "/etc/udev/rules.d/99-predator-control.rules",
+    "/etc/systemd/system/predator-permissions.service",
     "/etc/sudoers.d/predator-control",
 ]
 
@@ -1166,8 +1170,13 @@ def _print_uninstall_help():
 
           /opt/predator-control
           /usr/local/bin/predator
+          /usr/local/bin/predator-permissions-fix
           /usr/share/applications/predator.desktop
           /etc/tmpfiles.d/predator-control.conf
+          /etc/tmpfiles.d/linuwu_sense.conf
+          /etc/udev/rules.d/99-predator-control.rules
+          /etc/systemd/system/predator-permissions.service
+          /etc/sudoers.d/predator-control
 
         It does NOT touch linuwu_sense, the kernel module, or the
         linuwu_sense.service.
@@ -1205,6 +1214,14 @@ def cmd_uninstall(args):
     if not existing:
         print("Nothing installed to remove.")
         raise SystemExit(0)
+
+    # Stop/disable our permissions service before deleting its unit file.
+    try:
+        subprocess.run(["sudo", "systemctl", "disable", "--now",
+                        "predator-permissions.service"],
+                       capture_output=True, text=True)
+    except (OSError, ValueError):
+        pass
 
     ok, failures = _uninstall_paths(existing)
     if not ok:
