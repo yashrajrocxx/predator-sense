@@ -174,6 +174,27 @@ sudo install -m 644 "$MODFILE" "$MDIR/${MODULE}.ko"
 sudo depmod -a
 ok "Kernel module installed"
 
+# Boot persistence FIRST, before any verification that can fail.
+# A previous version wrote these files only after strict hardware checks,
+# so a check that dies (e.g. 'performance' missing on battery) left the
+# .ko installed but with no modules-load/blacklist -> driver lost on reboot.
+log "Configuring boot persistence"
+printf '%s\n' "$MODULE" | sudo tee "$MODULES_LOAD_FILE" >/dev/null
+printf 'blacklist %s\n' "$CONFLICT" | sudo tee "$BLACKLIST_FILE" >/dev/null
+sudo depmod -a
+ok "Kernel module will load at boot and acer_wmi is blacklisted"
+
+# Regenerate initramfs so the blacklist applies to early-boot probing.
+# Without this, acer_wmi can still load from initramfs before modules-load.
+if command -v mkinitcpio >/dev/null 2>&1; then
+    log "Regenerating initramfs (blacklist takes effect early)"
+    if sudo mkinitcpio -P >/dev/null 2>&1; then
+        ok "Initramfs regenerated"
+    else
+        warn "mkinitcpio failed; blacklist still applies after initramfs. Run 'sudo mkinitcpio -P' manually."
+    fi
+fi
+
 log "Loading Linuwu-Sense"
 if ! sudo modprobe "$MODULE"; then
     echo
@@ -228,14 +249,24 @@ else
 fi
 
 # Platform profile is expected to be registered by this driver on PHN16-71.
+# NOTE: 'performance' is AC-only on this machine. On battery the kernel may
+# only expose low-power/quiet/balanced, so missing 'performance' off-AC is a
+# warning, not a fatal install error (persistence is already written above).
 if [[ -r /sys/firmware/acpi/platform_profile_choices && -r /sys/firmware/acpi/platform_profile ]]; then
     profile_choices="$(cat /sys/firmware/acpi/platform_profile_choices)"
     current_profile="$(cat /sys/firmware/acpi/platform_profile)"
     printf 'Profiles     : %s\nCurrent      : %s\n' "$profile_choices" "$current_profile"
+    on_ac="1"
+    [[ -r /sys/class/power_supply/ACAD/online ]] && on_ac="$(cat /sys/class/power_supply/ACAD/online 2>/dev/null || echo 1)"
     [[ "$profile_choices" == *"quiet"* ]] || die "quiet profile missing"
     [[ "$profile_choices" == *"balanced"* ]] || die "balanced profile missing"
-    [[ "$profile_choices" == *"performance"* ]] || die "performance profile missing"
-    ok "Thermal profile interface present"
+    if [[ "$profile_choices" == *"performance"* ]]; then
+        ok "Thermal profile interface present"
+    elif [[ "$on_ac" == "1" ]]; then
+        die "performance profile missing (on AC power)"
+    else
+        warn "performance profile missing (on battery - expected, will appear on AC)"
+    fi
 else
     die "ACPI platform profile interface is missing"
 fi
@@ -247,11 +278,12 @@ printf 'RGB zones    : %s\nRGB effect   : %s\n' "$per_zone_state" "$four_zone_st
 [[ -n "$per_zone_state" && -n "$four_zone_state" ]] || die "RGB interfaces returned empty state"
 ok "RGB state interfaces readable"
 
-log "Configuring boot persistence"
-printf '%s\n' "$MODULE" | sudo tee "$MODULES_LOAD_FILE" >/dev/null
-printf 'blacklist %s\n' "$CONFLICT" | sudo tee "$BLACKLIST_FILE" >/dev/null
-sudo depmod -a
-ok "Kernel module will load at boot and acer_wmi is blacklisted"
+log "Verifying boot persistence (written before hardware checks)"
+[[ -f "$MODULES_LOAD_FILE" ]] || die "modules-load file missing: $MODULES_LOAD_FILE"
+[[ -f "$BLACKLIST_FILE" ]] || die "blacklist file missing: $BLACKLIST_FILE"
+grep -qx "$MODULE" "$MODULES_LOAD_FILE" || die "modules-load does not contain $MODULE"
+grep -qx "blacklist $CONFLICT" "$BLACKLIST_FILE" || die "blacklist does not contain $CONFLICT"
+ok "Boot persistence files present"
 
 log "Installing state-restore service"
 sudo install -m 644 "$SOURCE/linuwu_sense.service" "$SERVICE_FILE"
@@ -299,6 +331,8 @@ log "Final verification"
 [[ -r "$PREDATOR_BASE/fan_speed" && -w "$PREDATOR_BASE/fan_speed" ]] || die "fan_speed is not readable/writable by root after tmpfiles setup"
 [[ -r "$KB_BASE/per_zone_mode" && -w "$KB_BASE/per_zone_mode" ]] || die "RGB interface permissions are incorrect"
 [[ -r "$PREDATOR_BASE/battery_limiter" && -w "$PREDATOR_BASE/battery_limiter" ]] || die "battery_limiter permissions are incorrect"
+[[ -f "$MODULES_LOAD_FILE" ]] || die "Final check failed: $MODULES_LOAD_FILE missing"
+[[ -f "$BLACKLIST_FILE" ]] || die "Final check failed: $BLACKLIST_FILE missing"
 
 if lsmod | awk '{print $1}' | grep -qx "$CONFLICT"; then
     die "Final check failed: $CONFLICT is loaded"
