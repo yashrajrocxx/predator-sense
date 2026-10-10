@@ -71,15 +71,21 @@ class TestPanel:
         self.orig_read = predator.read_sysfs
         self.orig_write = predator.write_sysfs
         self.orig_exists = predator.exists_sysfs
+        self.orig_save = predator.StateStore.save
+        self.orig_power = predator.get_power_source
         self.panel = FakeSysfs()
         predator.read_sysfs = self.panel.read
         predator.write_sysfs = self.panel.write
         predator.exists_sysfs = lambda p: True
+        predator.StateStore.save = staticmethod(lambda *a, **k: True)
+        predator.get_power_source = lambda: "ac"
 
     def uninstall(self):
         predator.read_sysfs = self.orig_read
         predator.write_sysfs = self.orig_write
         predator.exists_sysfs = self.orig_exists
+        predator.StateStore.save = self.orig_save
+        predator.get_power_source = self.orig_power
 
 
 fakepanel = TestPanel()

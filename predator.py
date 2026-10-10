@@ -25,8 +25,23 @@ FOUR_ZONED_KB = DRIVER_BASE / "four_zoned_kb"
 HWMON_BASE = DRIVER_BASE / "hwmon"
 PLATFORM_PROFILE = Path("/sys/firmware/acpi/platform_profile")
 PLATFORM_PROFILE_CHOICES = Path("/sys/firmware/acpi/platform_profile_choices")
-BATTERY_CAPACITY = Path("/sys/class/power_supply/BAT1/capacity")
-BATTERY_STATUS = Path("/sys/class/power_supply/BAT1/status")
+POWER_SUPPLY_BASE = Path("/sys/class/power_supply")
+
+
+def _find_battery(base: str) -> Path:
+    """Resolve BAT1/BAT0 dynamically; fall back to BAT1 for error messages."""
+    for name in ("BAT1", "BAT0"):
+        p = POWER_SUPPLY_BASE / name / base
+        try:
+            if p.exists():
+                return p
+        except OSError:
+            continue
+    return POWER_SUPPLY_BASE / "BAT1" / base
+
+
+BATTERY_CAPACITY = POWER_SUPPLY_BASE / "BAT1/capacity"
+BATTERY_STATUS = POWER_SUPPLY_BASE / "BAT1/status"
 
 FAN_SPEED = PREDATOR_SENSE / "fan_speed"
 BATTERY_LIMITER = PREDATOR_SENSE / "battery_limiter"
@@ -208,7 +223,7 @@ def read_sysfs(path: Path) -> Optional[str]:
         if DEBUG:
             logger.error("File not found: %s", path)
         return None
-    except OSError as e:
+    except (OSError, ValueError, UnicodeError) as e:
         if DEBUG:
             logger.error("OS error reading %s: %s", path, e)
         return None
@@ -238,14 +253,21 @@ def exists_sysfs(path: Path) -> bool:
 
 def find_hwmon() -> Optional[Path]:
     """Find the linuwu_sense hwmon directory."""
-    if not HWMON_BASE.exists():
+    try:
+        if not HWMON_BASE.exists():
+            return None
+    except OSError:
         return None
-    for entry in sorted(HWMON_BASE.iterdir()):
+    try:
+        entries = sorted(HWMON_BASE.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
         if entry.name.startswith("hwmon") and entry.is_dir():
             name_file = entry / "name"
             if name_file.exists():
                 name = read_sysfs(name_file)
-                if name and "acer" in name.lower():
+                if name and ("acer" in name.lower() or "linuwu" in name.lower()):
                     return entry
     return None
 
@@ -319,7 +341,7 @@ class BatteryController:
     @staticmethod
     def get_state() -> BatteryState:
         state = BatteryState()
-        cap = read_sysfs(BATTERY_CAPACITY)
+        cap = read_sysfs(_find_battery("capacity"))
         if cap is not None:
             try:
                 state.capacity = int(cap)
@@ -331,7 +353,7 @@ class BatteryController:
         cal = read_sysfs(BATTERY_CALIBRATION)
         if cal is not None:
             state.calibration_enabled = cal.strip() == "1"
-        status_val = read_sysfs(BATTERY_STATUS)
+        status_val = read_sysfs(_find_battery("status"))
         if status_val is not None:
             state.status = status_val
         return state
@@ -509,19 +531,23 @@ class StatusReader:
 # ── Power Source & Persistent State ──────────────────────────────────
 
 def get_power_source() -> str:
-    """Return 'ac' when on mains, else 'battery'. Defaults to ac when unknown."""
+    """Return 'ac' when any mains supply is online, else 'battery'."""
+    found_mains = False
     try:
-        for psu in Path("/sys/class/power_supply").iterdir():
+        for psu in POWER_SUPPLY_BASE.iterdir():
             try:
                 ptype = (psu / "type").read_text().strip()
-            except OSError:
+            except (OSError, ValueError, UnicodeError):
                 continue
             if ptype == "Mains":
+                found_mains = True
                 try:
-                    online = (psu / "online").read_text().strip()
-                    return "ac" if online == "1" else "battery"
-                except OSError:
+                    if (psu / "online").read_text().strip() == "1":
+                        return "ac"
+                except (OSError, ValueError, UnicodeError):
                     continue
+        if found_mains:
+            return "battery"
     except OSError:
         pass
     return "ac"
@@ -570,6 +596,20 @@ class StateStore:
         }
 
     @staticmethod
+    def _coerce_bool(value, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            v = value.strip().lower()
+            if v in ("1", "true", "on", "yes", "enabled"):
+                return True
+            if v in ("0", "false", "off", "no", "disabled"):
+                return False
+        return default
+
+    @staticmethod
     def save(power: Optional[str] = None, snapshot: Optional[dict] = None) -> bool:
         if power is None:
             power = get_power_source()
@@ -577,10 +617,19 @@ class StateStore:
             data = snapshot if snapshot is not None else StateStore.snapshot()
             data = dict(data)
             data["power"] = power
+            payload = json.dumps(data, indent=2)
+        except (TypeError, ValueError) as e:
+            if DEBUG:
+                logger.error("State serialize failed: %s", e)
+            return False
+        try:
             STATE_DIR.mkdir(parents=True, exist_ok=True)
-            tmp = STATE_DIR / f".state-{power}.tmp"
-            tmp.write_text(json.dumps(data, indent=2))
-            tmp.rename(StateStore.path_for(power))
+            tmp = STATE_DIR / f".state-{power}.{os.getpid()}.tmp"
+            with open(tmp, "w") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.rename(tmp, StateStore.path_for(power))
             try:
                 import grp
                 gid = grp.getgrnam("linuwu_sense").gr_gid
@@ -600,26 +649,43 @@ class StateStore:
             except (KeyError, OSError):
                 pass
             return True
-        except OSError as e:
+        except (OSError, ValueError) as e:
             if DEBUG:
                 logger.error("State save failed: %s", e)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
             return False
 
     @staticmethod
-    def load(power: str) -> Optional[dict]:
-        p = StateStore.path_for(power)
-        if not p.exists():
-            # Fallback: try the other file so a fresh install still restores something.
-            other = StateStore.path_for("battery" if power == "ac" else "ac")
-            p = other if other.exists() else p
-            if not p.exists():
-                return None
+    def load(power: str) -> tuple[Optional[dict], Optional[str]]:
+        """Load saved state. Returns (state, note).
+
+        note is None on exact hit, 'fallback:<other>' when the other power
+        file was used, 'missing' when nothing exists, 'corrupt' on bad JSON,
+        or 'version' on schema mismatch.
+        """
+        primary = StateStore.path_for(power)
+        other_power = "battery" if power == "ac" else "ac"
+        other = StateStore.path_for(other_power)
+        target: Optional[Path] = None
+        note: Optional[str] = None
+        if primary.exists():
+            target, note = primary, None
+        elif other.exists():
+            target, note = other, f"fallback:{other_power}"
+        else:
+            return None, "missing"
         try:
-            return json.loads(p.read_text())
-        except (OSError, ValueError) as e:
+            data = json.loads(target.read_text())
+        except (OSError, ValueError, UnicodeError) as e:
             if DEBUG:
-                logger.error("State load failed %s: %s", p, e)
-            return None
+                logger.error("State load failed %s: %s", target, e)
+            return None, "corrupt"
+        if not isinstance(data, dict) or data.get("version") != STATE_VERSION:
+            return None, "version"
+        return data, note
 
     @staticmethod
     def apply(state: dict) -> list[str]:
@@ -632,19 +698,44 @@ class StateStore:
             _SUPPRESS_AUTOSAVE = False
 
     @staticmethod
+    def _clamp_int(value, default: int, low: int, high: int) -> int:
+        try:
+            iv = int(value)
+        except (TypeError, ValueError):
+            return default
+        return max(low, min(high, iv))
+
+    @staticmethod
+    def _clean_hex(value, default: str = "000000") -> str:
+        if not isinstance(value, str):
+            return default
+        v = value.strip().lower().lstrip("#")
+        if len(v) != 6:
+            return default
+        try:
+            int(v, 16)
+        except ValueError:
+            return default
+        return v
+
+    @staticmethod
     def _apply_inner(state: dict) -> list[str]:
         errors: list[str] = []
+        if not isinstance(state, dict):
+            return ["invalid state"]
         # Battery flags first (independent of power source).
         try:
             if "battery_limiter" in state:
-                ok, _ = BatteryController.set_limiter(bool(state["battery_limiter"]))
+                ok, _ = BatteryController.set_limiter(
+                    StateStore._coerce_bool(state["battery_limiter"]))
                 if not ok:
                     errors.append("battery_limiter")
         except Exception as e:
             errors.append(f"battery_limiter: {e}")
         try:
             if "battery_calibration" in state:
-                ok, _ = BatteryController.set_calibration(bool(state["battery_calibration"]))
+                ok, _ = BatteryController.set_calibration(
+                    StateStore._coerce_bool(state["battery_calibration"]))
                 if not ok:
                     errors.append("battery_calibration")
         except Exception as e:
@@ -652,8 +743,10 @@ class StateStore:
         # Fans.
         try:
             f = state.get("fans", {})
-            if f.get("available", True):
-                ok, _ = FanController.set_fans(int(f.get("cpu", 0)), int(f.get("gpu", 0)))
+            if isinstance(f, dict) and f.get("available", True):
+                cpu = StateStore._clamp_int(f.get("cpu", 0), 0, 0, 100)
+                gpu = StateStore._clamp_int(f.get("gpu", 0), 0, 0, 100)
+                ok, _ = FanController.set_fans(cpu, gpu)
                 if not ok:
                     errors.append("fans")
         except Exception as e:
@@ -664,20 +757,21 @@ class StateStore:
             if prof and prof != "unknown":
                 ok, _ = ProfileController.set_profile(str(prof))
                 if not ok:
-                    # Try mapped short name once more (turbo->performance etc.)
-                    ok2, _ = ProfileController.set_profile(str(prof).lower())
-                    if not ok2:
-                        errors.append(f"profile '{prof}' rejected (on battery?)")
+                    errors.append(f"profile '{prof}' rejected (on battery?)")
         except Exception as e:
             errors.append(f"profile: {e}")
         # Keyboard global effect.
         try:
             k4 = state.get("keyboard_four_zone", {})
-            if k4.get("available", True):
+            if isinstance(k4, dict) and k4.get("available", True):
                 ok = KeyboardController.set_four_zone_mode(
-                    int(k4.get("mode", 0)), int(k4.get("speed", 0)),
-                    int(k4.get("brightness", 100)), int(k4.get("direction", 0)),
-                    int(k4.get("r", 0)), int(k4.get("g", 0)), int(k4.get("b", 0)),
+                    StateStore._clamp_int(k4.get("mode", 0), 0, 0, 7),
+                    StateStore._clamp_int(k4.get("speed", 0), 0, 0, 9),
+                    StateStore._clamp_int(k4.get("brightness", 100), 100, 0, 100),
+                    StateStore._clamp_int(k4.get("direction", 0), 0, 0, 2),
+                    StateStore._clamp_int(k4.get("r", 0), 0, 0, 255),
+                    StateStore._clamp_int(k4.get("g", 0), 0, 0, 255),
+                    StateStore._clamp_int(k4.get("b", 0), 0, 0, 255),
                 )
                 if not ok:
                     errors.append("keyboard effect")
@@ -686,11 +780,13 @@ class StateStore:
         # Keyboard per-zone colors.
         try:
             kz = state.get("keyboard_zones", {})
-            if kz:
+            if isinstance(kz, dict) and kz:
                 ok = KeyboardController.set_per_zone(
-                    str(kz.get("z1", "000000")), str(kz.get("z2", "000000")),
-                    str(kz.get("z3", "000000")), str(kz.get("z4", "000000")),
-                    int(kz.get("brightness", 100)),
+                    StateStore._clean_hex(kz.get("z1", "000000")),
+                    StateStore._clean_hex(kz.get("z2", "000000")),
+                    StateStore._clean_hex(kz.get("z3", "000000")),
+                    StateStore._clean_hex(kz.get("z4", "000000")),
+                    StateStore._clamp_int(kz.get("brightness", 100), 100, 0, 100),
                 )
                 if not ok:
                     errors.append("keyboard zones")
@@ -710,12 +806,20 @@ class StateStore:
                     break
             if not check_driver():
                 return False, ["driver not loaded"]
-        state = StateStore.load(power)
+        state, note = StateStore.load(power)
         if state is None:
-            return False, [f"no saved state for '{power}' (run some commands first)"]
-        # Permissions at boot may still be root-only; fix attempt is harmless.
+            if note == "missing":
+                return False, [f"no saved state for '{power}' (run some commands first)"]
+            if note == "corrupt":
+                return False, [f"saved state for '{power}' is corrupt (not valid JSON)"]
+            if note == "version":
+                return False, [f"saved state for '{power}' has unsupported version"]
+            return False, [f"no saved state for '{power}'"]
+        warnings: list[str] = []
+        if note and note.startswith("fallback:"):
+            warnings.append(f"no '{power}' snapshot; using '{note.split(':', 1)[1]}' snapshot")
         errors = StateStore.apply(state)
-        return (len(errors) == 0), errors
+        return (len(errors) == 0), warnings + errors
 
 
 def autosave_current_state():
@@ -754,6 +858,20 @@ def validate_color_hex(value: str) -> str:
     except ValueError:
         print_error(f"Color must be valid hexadecimal, got '{value}'")
         raise SystemExit(1)
+    return v
+
+
+def validate_color_hex_quiet(value) -> Optional[str]:
+    """Non-fatal hex validation for privileged entry points. Returns None if bad."""
+    if not isinstance(value, str):
+        return None
+    v = value.strip().lower().lstrip("#")
+    if len(v) != 6:
+        return None
+    try:
+        int(v, 16)
+    except ValueError:
+        return None
     return v
 
 
@@ -814,21 +932,29 @@ def validate_battery_limit(value: str) -> int:
 # ── Driver Check ───────────────────────────────────────────────────────
 
 def check_driver() -> bool:
-    if not DRIVER_BASE.exists():
-        return False
-    if not PREDATOR_SENSE.exists():
+    try:
+        if not DRIVER_BASE.exists():
+            return False
+        if not PREDATOR_SENSE.exists():
+            return False
+        if not FOUR_ZONED_KB.exists():
+            return False
+    except OSError:
         return False
     return True
 
 
 def check_permissions() -> bool:
     test_file = FAN_SPEED
-    if not test_file.exists():
+    try:
+        if not test_file.exists():
+            return False
+    except OSError:
         return False
     try:
         test_file.read_text()
         return True
-    except PermissionError:
+    except (PermissionError, OSError, ValueError, UnicodeError):
         return False
 
 
@@ -904,9 +1030,11 @@ def print_battery_help():
           calibration <value> Enable or disable battery calibration
           help                Show this help
 
-        Battery limiter:
-          0-99 or off   Disable battery limit
-          100 or on     Enable battery limit (caps at 80%)
+        Battery limiter (caps charge at 80% when enabled):
+          on, 80        Enable battery limit
+          off, 100      Disable battery limit
+          1-99          Enable battery limit
+          0             Disable battery limit
 
         Battery calibration:
           on            Start calibration
@@ -1139,13 +1267,18 @@ def cmd_keyboard(args):
         return
 
     if args and args[0] == "--apply-mode":
+        if len(args) != 8:
+            print_error("--apply-mode requires 7 values: mode speed brightness direction r g b")
+            raise SystemExit(1)
         try:
             vals = [int(v) for v in args[1:8]]
         except ValueError:
-            print_error("Invalid values for --apply-mode.")
+            print_error("Invalid values for --apply-mode (expected integers).")
             raise SystemExit(1)
-        if len(vals) != 7:
-            print_error("--apply-mode requires 7 values: mode speed brightness direction r g b")
+        mode, speed, brightness, direction, r, g, b = vals
+        if not (0 <= mode <= 7 and 0 <= speed <= 9 and 0 <= brightness <= 100
+                and 0 <= direction <= 2 and all(0 <= c <= 255 for c in (r, g, b))):
+            print_error("Out-of-range values for --apply-mode.")
             raise SystemExit(1)
         ok = KeyboardController.set_four_zone_mode(*vals)
         raise SystemExit(0 if ok else 1)
@@ -1155,10 +1288,17 @@ def cmd_keyboard(args):
         if len(vals) != 5:
             print_error("--apply-zones requires 5 values: c1 c2 c3 c4 brightness")
             raise SystemExit(1)
+        for c in vals[:4]:
+            if validate_color_hex_quiet(c) is None:
+                print_error(f"Invalid zone color: '{c}' (expected 6 hex digits)")
+                raise SystemExit(1)
         try:
             brightness = int(vals[4])
         except ValueError:
             print_error(f"Invalid brightness: {vals[4]}")
+            raise SystemExit(1)
+        if not 0 <= brightness <= 100:
+            print_error(f"Brightness must be between 0 and 100, got {brightness}")
             raise SystemExit(1)
         ok = KeyboardController.set_per_zone(vals[0], vals[1], vals[2], vals[3], brightness)
         raise SystemExit(0 if ok else 1)
@@ -1234,9 +1374,6 @@ def cmd_status(args):
 
 
 def cmd_selftest(args):
-    if not args or args[0] != "--no-write":
-        pass
-
     print("Predator Control self-test")
     print()
 
@@ -1315,7 +1452,8 @@ def _parse_power_arg(args) -> str:
         return "auto"
     if a in ("help", "h"):
         return "help"
-    return "auto"
+    print_error(f"Unknown power source: '{args[0]}' (expected ac|battery|both|auto)")
+    raise SystemExit(1)
 
 
 def cmd_save(args):
@@ -1364,7 +1502,10 @@ def cmd_restore(args):
               Default (auto) uses current AC/battery status.
         """))
         return
-    power = get_power_source() if target in ("auto", "both") else target
+    power = get_power_source() if target == "auto" else target
+    if target == "both":
+        print_error("restore accepts only ac|battery|auto (not both).")
+        raise SystemExit(1)
     ok, errors = StateStore.restore(power, wait_driver=True)
     if ok:
         print(f"Restored '{power}' state (power now: {get_power_source()}).")
@@ -1413,13 +1554,14 @@ def launch_gui(selftest: bool = False):
 # ── Uninstall ──────────────────────────────────────────────────────────
 
 # Exact paths this app owns. Removing anything else is a bug.
+# NOTE: /etc/tmpfiles.d/linuwu_sense.conf belongs to predator-driver.sh
+# (the kernel driver installer) and is intentionally not removed here.
 APP_INSTALLABLE_PATHS = [
     "/opt/predator-control",
     "/usr/local/bin/predator",
     "/usr/local/bin/predator-permissions-fix",
     "/usr/share/applications/predator.desktop",
     "/etc/tmpfiles.d/predator-control.conf",
-    "/etc/tmpfiles.d/linuwu_sense.conf",
     "/etc/udev/rules.d/99-predator-control.rules",
     "/etc/systemd/system/predator-permissions.service",
     "/etc/systemd/system/predator-restore.service",
@@ -1436,6 +1578,8 @@ def _needs_privilege(cmd: str, args) -> bool:
     if cmd not in PRIV_COMMANDS:
         return False
     if cmd in ("restore", "on-ac-change"):
+        if args and args[0].lower() in ("status", "help", "-h", "--help"):
+            return False
         return True
     if cmd == "save":
         return False  # state dir is group-writable; root not required
@@ -1443,7 +1587,7 @@ def _needs_privilege(cmd: str, args) -> bool:
         return True
     if not args:
         return False
-    return args[0] not in ("status", "help")
+    return args[0].lower() not in ("status", "help")
 
 
 def _session_has_linuwu_sense_group() -> bool:
@@ -1479,7 +1623,11 @@ def _run_elevated(args_list) -> None:
         if probe.returncode != 0:
             return
         r = subprocess.run(["sudo", "-n", script, *args_list], env=env)
-    except OSError:
+    except FileNotFoundError:
+        print_error("sudo is required for this write command.")
+        raise SystemExit(1)
+    except OSError as e:
+        print_error(f"Failed to elevate privileges: {e}")
         raise SystemExit(1)
     raise SystemExit(r.returncode)
 
@@ -1497,14 +1645,14 @@ def _uninstall_paths(paths: list[Path]) -> tuple[bool, list[str]]:
                 return False, [f"{p}: {e}"]
         return True, []
     else:
-        cmd = ["sudo", "rm", "-rf", *[str(p) for p in paths]]
+        cmd = ["sudo", "-n", "rm", "-rf", *[str(p) for p in paths]]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True)
         except FileNotFoundError:
             print_error("sudo is required for uninstall.")
             return False, ["sudo not found"]
         if r.returncode != 0:
-            return False, [r.stderr.strip() or "sudo rm failed"]
+            return False, [r.stderr.strip() or "sudo rm failed (password may be required)"]
         return True, []
 
 
@@ -1520,14 +1668,14 @@ def _print_uninstall_help():
           /usr/local/bin/predator-permissions-fix
           /usr/share/applications/predator.desktop
           /etc/tmpfiles.d/predator-control.conf
-          /etc/tmpfiles.d/linuwu_sense.conf
           /etc/udev/rules.d/99-predator-control.rules
           /etc/systemd/system/predator-permissions.service
           /etc/systemd/system/predator-restore.service
           /etc/sudoers.d/predator-control
           /var/lib/predator-control
 
-        It does NOT touch linuwu_sense, the kernel module, or the
+        It does NOT touch linuwu_sense, the kernel module,
+        /etc/tmpfiles.d/linuwu_sense.conf, or the
         linuwu_sense.service.
 
         Options:

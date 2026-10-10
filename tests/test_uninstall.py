@@ -27,7 +27,6 @@ class UninstallPathTests(unittest.TestCase):
             "/usr/local/bin/predator-permissions-fix",
             "/usr/share/applications/predator.desktop",
             "/etc/tmpfiles.d/predator-control.conf",
-            "/etc/tmpfiles.d/linuwu_sense.conf",
             "/etc/udev/rules.d/99-predator-control.rules",
             "/etc/systemd/system/predator-permissions.service",
             "/etc/systemd/system/predator-restore.service",
