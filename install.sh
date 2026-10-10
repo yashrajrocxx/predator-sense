@@ -289,6 +289,52 @@ setup_sudoers() {
     fi
 }
 
+# ── Stage 6c: AC/battery persistent settings ─────────────────────────
+# Every successful write auto-saves to /var/lib/predator-control/state-{ac,battery}.json.
+# This service restores the right file at boot; udev restores on AC plug/unplug.
+setup_persistence() {
+    say "Installing AC/battery settings persistence ..."
+    sudo mkdir -p /var/lib/predator-control
+    sudo chgrp linuwu_sense /var/lib/predator-control 2>/dev/null || true
+    sudo chmod 775 /var/lib/predator-control
+
+    # Seed both state files from current hardware so first boot has something.
+    if [[ -x /opt/predator-control/predator.py ]]; then
+        sudo /opt/predator-control/predator.py save both >/dev/null 2>&1 || \
+            /opt/predator-control/predator.py save both >/dev/null 2>&1 || true
+        sudo chgrp linuwu_sense /var/lib/predator-control/*.json 2>/dev/null || true
+        sudo chmod 664 /var/lib/predator-control/*.json 2>/dev/null || true
+    fi
+
+    sudo tee /etc/systemd/system/predator-restore.service >/dev/null <<'EOF'
+[Unit]
+Description=Restore Predator Control settings (AC/battery)
+After=predator-permissions.service
+[Service]
+Type=oneshot
+ExecStart=/opt/predator-control/predator.py on-ac-change
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # Rewrite udev rules with permissions fix + AC auto-switch.
+    # AC rule only pokes our own restore service (no blocking driver writes in udev).
+    sudo tee /etc/udev/rules.d/99-predator-control.rules >/dev/null <<'EOF'
+# Predator Control - grant linuwu_sense group write access on driver sysfs nodes
+SUBSYSTEM=="platform", DRIVER=="acer-wmi", RUN+="/usr/local/bin/predator-permissions-fix"
+ACTION=="add", SUBSYSTEM=="firmware", RUN+="/usr/local/bin/predator-permissions-fix"
+# Predator Control - auto-switch AC vs battery saved settings
+SUBSYSTEM=="power_supply", ATTR{type}=="Mains", RUN+="/bin/systemctl --no-block start predator-restore.service"
+EOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable predator-restore.service >/dev/null 2>&1 || true
+    sudo systemctl enable predator-permissions.service >/dev/null 2>&1 || true
+    sudo systemctl start predator-restore.service >/dev/null 2>&1 || true
+    sudo udevadm control --reload-rules 2>/dev/null || true
+    say "    AC/battery persistence installed (predator-restore.service + power_supply udev)"
+}
+
 # ── Stage 7: desktop entry ───────────────────────────────────────────
 install_desktop() {
     say "Installing desktop entry ..."
@@ -350,6 +396,7 @@ main() {
     setup_tmpfiles
     setup_perm_fix
     setup_sudoers
+    setup_persistence
     install_desktop
     verify
     echo ""
@@ -357,6 +404,8 @@ main() {
     echo ""
     say "Try:  predator status        -- full system status"
     say "      predator keyboard      -- keyboard RGB GUI"
+    say "      predator save both     -- snapshot AC+battery states"
+    say "      predator restore       -- restore for current power source"
     say "      predator help          -- all commands"
 }
 

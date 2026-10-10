@@ -243,9 +243,18 @@ elevation handles it automatically — no logout needed.
 
 ## Persistence
 
-Hardware state is persisted by the **Linuwu-Sense driver** (its `linuwu_sense.service`
-restores fan/profile/RGB state at boot). Predator Control does not run a daemon and
-does not duplicate that state. It simply writes the desired state through the driver.
+Every successful write auto-saves to `/var/lib/predator-control/state-{ac,battery}.json`
+(fans, profile/turbo, battery limiter/calibration, keyboard effect + per-zone colors).
+
+* `predator-restore.service` runs `predator on-ac-change` at boot (after
+  `predator-permissions.service`), restoring the file matching current power.
+* udev `SUBSYSTEM=="power_supply", ATTR{type}=="Mains"` runs the same on AC
+  plug/unplug, so AC and battery have separate remembered states.
+* Manual: `predator save [ac|battery|both|auto]`, `predator restore [ac|battery|auto]`.
+* Workflow: plug in → set turbo/fans/RGB → auto-saved to `state-ac.json`;
+  unplug → set quiet/eco/fans/RGB → auto-saved to `state-battery.json`.
+  From then on it switches automatically. `performance` needs AC; on battery
+  restore warns and keeps other settings.
 
 ## Troubleshooting
 

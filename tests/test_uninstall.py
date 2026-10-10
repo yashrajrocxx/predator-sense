@@ -30,7 +30,9 @@ class UninstallPathTests(unittest.TestCase):
             "/etc/tmpfiles.d/linuwu_sense.conf",
             "/etc/udev/rules.d/99-predator-control.rules",
             "/etc/systemd/system/predator-permissions.service",
+            "/etc/systemd/system/predator-restore.service",
             "/etc/sudoers.d/predator-control",
+            "/var/lib/predator-control",
         ])
 
     @mock.patch.object(os, "geteuid", return_value=0)

@@ -17,6 +17,8 @@ TMPFILES_FILE="/etc/tmpfiles.d/predator-control.conf"
 DRIVER_TMPFILES="/etc/tmpfiles.d/linuwu_sense.conf"
 UDEV_RULE="/etc/udev/rules.d/99-predator-control.rules"
 PERM_SERVICE="/etc/systemd/system/predator-permissions.service"
+RESTORE_SERVICE="/etc/systemd/system/predator-restore.service"
+STATE_DIR="/var/lib/predator-control"
 SUDOERS_FILE="/etc/sudoers.d/predator-control"
 
 say() { printf '\033[1;32m%s\033[0m\n' "$*"; }
@@ -26,7 +28,7 @@ die() { printf '\033[1;31mError: %s\033[0m\n' "$*" >&2; exit 1; }
 check_app_path() {
     local path="$1"
     [[ -e "$path" || -L "$path" ]] || return 1
-    echo "$path" | grep -qx '/opt/predator-control\|/usr/local/bin/predator\|/usr/local/bin/predator-permissions-fix\|/usr/share/applications/predator.desktop\|/etc/tmpfiles.d/predator-control.conf\|/etc/tmpfiles.d/linuwu_sense.conf\|/etc/udev/rules.d/99-predator-control.rules\|/etc/systemd/system/predator-permissions.service\|/etc/sudoers.d/predator-control' \
+    echo "$path" | grep -qx '/opt/predator-control\|/usr/local/bin/predator\|/usr/local/bin/predator-permissions-fix\|/usr/share/applications/predator.desktop\|/etc/tmpfiles.d/predator-control.conf\|/etc/tmpfiles.d/linuwu_sense.conf\|/etc/udev/rules.d/99-predator-control.rules\|/etc/systemd/system/predator-permissions.service\|/etc/systemd/system/predator-restore.service\|/var/lib/predator-control\|/etc/sudoers.d/predator-control' \
         || die "Refusing to delete unrecognized path: $path"
     return 0
 }
@@ -35,8 +37,9 @@ fallback_uninstall() {
     echo "Uninstalling Predator Control (user-space app only) ..."
     echo "The linuwu_sense driver and its service are left untouched."
     sudo systemctl disable --now predator-permissions.service 2>/dev/null || true
+    sudo systemctl disable --now predator-restore.service 2>/dev/null || true
     sudo systemctl daemon-reload 2>/dev/null || true
-    for p in "$APP_DIR" "$BIN_LINK" "$PERM_FIX" "$DESKTOP_FILE" "$TMPFILES_FILE" "$DRIVER_TMPFILES" "$UDEV_RULE" "$PERM_SERVICE" "$SUDOERS_FILE"; do
+    for p in "$APP_DIR" "$BIN_LINK" "$PERM_FIX" "$DESKTOP_FILE" "$TMPFILES_FILE" "$DRIVER_TMPFILES" "$UDEV_RULE" "$PERM_SERVICE" "$RESTORE_SERVICE" "$STATE_DIR" "$SUDOERS_FILE"; do
         if check_app_path "$p"; then
             sudo rm -rf "$p"
             say "    Removed: $p"

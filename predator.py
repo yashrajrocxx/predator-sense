@@ -5,11 +5,10 @@ Requires: linuwu_sense kernel driver
 """
 
 import argparse
-import enum
+import json
 import logging
 import os
 import shutil
-import signal
 import subprocess
 import sys
 import textwrap
@@ -45,6 +44,14 @@ DEBUG = os.environ.get("PREDATOR_DEBUG", "0") == "1"
 logger = logging.getLogger("predator")
 
 APP_ROOT = Path(__file__).resolve().parent
+
+# ── Persistent State (AC vs battery) ───────────────────────────────────
+# Auto-saved on every successful write, restored at boot and on AC plug/unplug.
+STATE_DIR = Path("/var/lib/predator-control")
+STATE_AC_FILE = STATE_DIR / "state-ac.json"
+STATE_BATTERY_FILE = STATE_DIR / "state-battery.json"
+STATE_VERSION = 1
+_SUPPRESS_AUTOSAVE = False
 
 # ── Enums ──────────────────────────────────────────────────────────────
 
@@ -262,7 +269,10 @@ class FanController:
         if not write_sysfs(FAN_SPEED, f"{cpu},{gpu}"):
             return False, FanState()
         actual = FanController.get_state()
-        return actual.cpu == cpu and actual.gpu == gpu, actual
+        ok = actual.cpu == cpu and actual.gpu == gpu
+        if ok:
+            autosave_current_state()
+        return ok, actual
 
     @staticmethod
     def set_auto() -> tuple[bool, FanState]:
@@ -289,13 +299,20 @@ class ProfileController:
 
     @staticmethod
     def set_profile(name: str) -> tuple[bool, ProfileState]:
-        target = PROFILE_MAP.get(name.lower())
-        if target is None:
+        key = name.lower()
+        if key in PROFILE_MAP:
+            target = PROFILE_MAP[key]
+        elif key in ("low-power", "quiet", "balanced", "balanced-performance", "performance"):
+            target = key  # raw kernel name
+        else:
             return False, ProfileState()
         if not write_sysfs(PLATFORM_PROFILE, target):
             return False, ProfileState()
         actual = ProfileController.get_state()
-        return actual.current == target, actual
+        ok = actual.current == target
+        if ok:
+            autosave_current_state()
+        return ok, actual
 
 
 class BatteryController:
@@ -325,7 +342,10 @@ class BatteryController:
         if not write_sysfs(BATTERY_LIMITER, val):
             return False, BatteryController.get_state()
         actual = BatteryController.get_state()
-        return actual.limiter_enabled == enabled, actual
+        ok = actual.limiter_enabled == enabled
+        if ok:
+            autosave_current_state()
+        return ok, actual
 
     @staticmethod
     def set_calibration(enabled: bool) -> tuple[bool, BatteryState]:
@@ -333,7 +353,10 @@ class BatteryController:
         if not write_sysfs(BATTERY_CALIBRATION, val):
             return False, BatteryController.get_state()
         actual = BatteryController.get_state()
-        return actual.calibration_enabled == enabled, actual
+        ok = actual.calibration_enabled == enabled
+        if ok:
+            autosave_current_state()
+        return ok, actual
 
 
 class KeyboardController:
@@ -375,14 +398,20 @@ class KeyboardController:
         red: int, green: int, blue: int,
     ) -> bool:
         val = f"{mode},{speed},{brightness},{direction},{red},{green},{blue}"
-        return write_sysfs(FOUR_ZONE_MODE, val)
+        ok = write_sysfs(FOUR_ZONE_MODE, val)
+        if ok:
+            autosave_current_state()
+        return ok
 
     @staticmethod
     def set_per_zone(
         zone1: str, zone2: str, zone3: str, zone4: str, brightness: int,
     ) -> bool:
         val = f"{zone1},{zone2},{zone3},{zone4},{brightness}"
-        return write_sysfs(PER_ZONE_MODE, val)
+        ok = write_sysfs(PER_ZONE_MODE, val)
+        if ok:
+            autosave_current_state()
+        return ok
 
     @staticmethod
     def set_global_effect(effect_name: str, speed: int, brightness: int,
@@ -475,6 +504,228 @@ class StatusReader:
         if v:
             s.driver_version = v
         return s
+
+
+# ── Power Source & Persistent State ──────────────────────────────────
+
+def get_power_source() -> str:
+    """Return 'ac' when on mains, else 'battery'. Defaults to ac when unknown."""
+    try:
+        for psu in Path("/sys/class/power_supply").iterdir():
+            try:
+                ptype = (psu / "type").read_text().strip()
+            except OSError:
+                continue
+            if ptype == "Mains":
+                try:
+                    online = (psu / "online").read_text().strip()
+                    return "ac" if online == "1" else "battery"
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return "ac"
+
+
+class StateStore:
+    """Snapshot / restore all predator-controllable hardware state.
+
+    Two files: state-ac.json and state-battery.json under STATE_DIR.
+    Auto-saved after every successful write; restored at boot and on
+    AC plug/unplug via systemd + udev.
+    """
+
+    @staticmethod
+    def path_for(power: str) -> Path:
+        return STATE_AC_FILE if power == "ac" else STATE_BATTERY_FILE
+
+    @staticmethod
+    def snapshot() -> dict:
+        s = StatusReader.get_full()
+        return {
+            "version": STATE_VERSION,
+            "power": get_power_source(),
+            "fans": {"cpu": s.fan.cpu, "gpu": s.fan.gpu,
+                     "available": s.fan.available},
+            "profile": s.profile.current,
+            "battery_limiter": s.battery.limiter_enabled,
+            "battery_calibration": s.battery.calibration_enabled,
+            "keyboard_four_zone": {
+                "mode": s.keyboard.mode,
+                "speed": s.keyboard.speed,
+                "brightness": s.keyboard.brightness,
+                "direction": s.keyboard.direction,
+                "r": s.keyboard.red,
+                "g": s.keyboard.green,
+                "b": s.keyboard.blue,
+                "available": s.keyboard.available,
+            },
+            "keyboard_zones": {
+                "z1": s.keyboard.per_zone.zone1,
+                "z2": s.keyboard.per_zone.zone2,
+                "z3": s.keyboard.per_zone.zone3,
+                "z4": s.keyboard.per_zone.zone4,
+                "brightness": s.keyboard.per_zone.brightness,
+            },
+        }
+
+    @staticmethod
+    def save(power: Optional[str] = None, snapshot: Optional[dict] = None) -> bool:
+        if power is None:
+            power = get_power_source()
+        try:
+            data = snapshot if snapshot is not None else StateStore.snapshot()
+            data = dict(data)
+            data["power"] = power
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = STATE_DIR / f".state-{power}.tmp"
+            tmp.write_text(json.dumps(data, indent=2))
+            tmp.rename(StateStore.path_for(power))
+            try:
+                import grp
+                gid = grp.getgrnam("linuwu_sense").gr_gid
+                try:
+                    os.chown(StateStore.path_for(power), -1, gid)
+                except OSError:
+                    pass
+                try:
+                    os.chmod(StateStore.path_for(power), 0o664)
+                    os.chmod(STATE_DIR, 0o775)
+                    try:
+                        os.chown(STATE_DIR, -1, gid)
+                    except OSError:
+                        pass
+                except OSError:
+                    pass
+            except (KeyError, OSError):
+                pass
+            return True
+        except OSError as e:
+            if DEBUG:
+                logger.error("State save failed: %s", e)
+            return False
+
+    @staticmethod
+    def load(power: str) -> Optional[dict]:
+        p = StateStore.path_for(power)
+        if not p.exists():
+            # Fallback: try the other file so a fresh install still restores something.
+            other = StateStore.path_for("battery" if power == "ac" else "ac")
+            p = other if other.exists() else p
+            if not p.exists():
+                return None
+        try:
+            return json.loads(p.read_text())
+        except (OSError, ValueError) as e:
+            if DEBUG:
+                logger.error("State load failed %s: %s", p, e)
+            return None
+
+    @staticmethod
+    def apply(state: dict) -> list[str]:
+        """Apply a saved snapshot. Returns list of error strings (empty = OK)."""
+        global _SUPPRESS_AUTOSAVE
+        _SUPPRESS_AUTOSAVE = True
+        try:
+            return StateStore._apply_inner(state)
+        finally:
+            _SUPPRESS_AUTOSAVE = False
+
+    @staticmethod
+    def _apply_inner(state: dict) -> list[str]:
+        errors: list[str] = []
+        # Battery flags first (independent of power source).
+        try:
+            if "battery_limiter" in state:
+                ok, _ = BatteryController.set_limiter(bool(state["battery_limiter"]))
+                if not ok:
+                    errors.append("battery_limiter")
+        except Exception as e:
+            errors.append(f"battery_limiter: {e}")
+        try:
+            if "battery_calibration" in state:
+                ok, _ = BatteryController.set_calibration(bool(state["battery_calibration"]))
+                if not ok:
+                    errors.append("battery_calibration")
+        except Exception as e:
+            errors.append(f"battery_calibration: {e}")
+        # Fans.
+        try:
+            f = state.get("fans", {})
+            if f.get("available", True):
+                ok, _ = FanController.set_fans(int(f.get("cpu", 0)), int(f.get("gpu", 0)))
+                if not ok:
+                    errors.append("fans")
+        except Exception as e:
+            errors.append(f"fans: {e}")
+        # Thermal profile (may be unavailable on battery, e.g. performance needs AC).
+        try:
+            prof = state.get("profile")
+            if prof and prof != "unknown":
+                ok, _ = ProfileController.set_profile(str(prof))
+                if not ok:
+                    # Try mapped short name once more (turbo->performance etc.)
+                    ok2, _ = ProfileController.set_profile(str(prof).lower())
+                    if not ok2:
+                        errors.append(f"profile '{prof}' rejected (on battery?)")
+        except Exception as e:
+            errors.append(f"profile: {e}")
+        # Keyboard global effect.
+        try:
+            k4 = state.get("keyboard_four_zone", {})
+            if k4.get("available", True):
+                ok = KeyboardController.set_four_zone_mode(
+                    int(k4.get("mode", 0)), int(k4.get("speed", 0)),
+                    int(k4.get("brightness", 100)), int(k4.get("direction", 0)),
+                    int(k4.get("r", 0)), int(k4.get("g", 0)), int(k4.get("b", 0)),
+                )
+                if not ok:
+                    errors.append("keyboard effect")
+        except Exception as e:
+            errors.append(f"keyboard effect: {e}")
+        # Keyboard per-zone colors.
+        try:
+            kz = state.get("keyboard_zones", {})
+            if kz:
+                ok = KeyboardController.set_per_zone(
+                    str(kz.get("z1", "000000")), str(kz.get("z2", "000000")),
+                    str(kz.get("z3", "000000")), str(kz.get("z4", "000000")),
+                    int(kz.get("brightness", 100)),
+                )
+                if not ok:
+                    errors.append("keyboard zones")
+        except Exception as e:
+            errors.append(f"keyboard zones: {e}")
+        return errors
+
+    @staticmethod
+    def restore(power: Optional[str] = None, wait_driver: bool = True) -> tuple[bool, list[str]]:
+        if power is None or power == "auto":
+            power = get_power_source()
+        if wait_driver and not check_driver():
+            # At boot the module may appear a few seconds after our service starts.
+            for _ in range(30):
+                time.sleep(1)
+                if check_driver():
+                    break
+            if not check_driver():
+                return False, ["driver not loaded"]
+        state = StateStore.load(power)
+        if state is None:
+            return False, [f"no saved state for '{power}' (run some commands first)"]
+        # Permissions at boot may still be root-only; fix attempt is harmless.
+        errors = StateStore.apply(state)
+        return (len(errors) == 0), errors
+
+
+def autosave_current_state():
+    """Best-effort auto-save after a successful write. Never raises."""
+    if _SUPPRESS_AUTOSAVE:
+        return
+    try:
+        StateStore.save()
+    except Exception:
+        pass
 
 
 # ── Validation ─────────────────────────────────────────────────────────
@@ -1049,6 +1300,95 @@ def cmd_selftest(args):
     check("sysfs access", lambda: check_permissions())
 
 
+def _parse_power_arg(args) -> str:
+    """Parse save/restore power arg: ac, battery, both, auto (default)."""
+    if not args:
+        return "auto"
+    a = args[0].lower().lstrip("-")
+    if a in ("ac", "mains"):
+        return "ac"
+    if a in ("battery", "bat", "dc"):
+        return "battery"
+    if a in ("both", "all"):
+        return "both"
+    if a in ("auto", "current"):
+        return "auto"
+    if a in ("help", "h"):
+        return "help"
+    return "auto"
+
+
+def cmd_save(args):
+    if not check_driver():
+        print_error("Linuwu-Sense driver not loaded.")
+        raise SystemExit(1)
+    target = _parse_power_arg(args)
+    if target == "help":
+        print(textwrap.dedent("""\
+            Usage: predator save [ac|battery|both|auto]
+
+              Saves current hardware state (fans, profile, battery flags,
+              keyboard effect + zones) for auto-restore on boot and on
+              AC plug/unplug. Auto-save already does this on every change;
+              this command is for manual snapshots.
+        """))
+        return
+    snap = StateStore.snapshot()
+    if target == "both":
+        ok1 = StateStore.save("ac", dict(snap, power="ac"))
+        ok2 = StateStore.save("battery", dict(snap, power="battery"))
+        if ok1 and ok2:
+            print("Saved current state for both AC and battery.")
+        else:
+            print_error("Failed to save state.")
+            raise SystemExit(1)
+        return
+    power = get_power_source() if target == "auto" else target
+    if StateStore.save(power, dict(snap, power=power)):
+        print(f"Saved current state for '{power}' (power now: {get_power_source()}).")
+    else:
+        print_error("Failed to save state.")
+        raise SystemExit(1)
+
+
+def cmd_restore(args):
+    if not check_driver():
+        print_error("Linuwu-Sense driver not loaded.")
+        raise SystemExit(1)
+    target = _parse_power_arg(args)
+    if target == "help":
+        print(textwrap.dedent("""\
+            Usage: predator restore [ac|battery|auto]
+
+              Restores saved state for the given power source.
+              Default (auto) uses current AC/battery status.
+        """))
+        return
+    power = get_power_source() if target in ("auto", "both") else target
+    ok, errors = StateStore.restore(power, wait_driver=True)
+    if ok:
+        print(f"Restored '{power}' state (power now: {get_power_source()}).")
+    else:
+        for e in errors:
+            print_error(f"Restore '{power}': {e}")
+        raise SystemExit(1)
+
+
+def cmd_on_ac_change(args):
+    # Called by udev on AC plug/unplug and by predator-restore.service at boot.
+    # Must be quiet-tolerant: never fail hard, just warn.
+    power = get_power_source()
+    ok, errors = StateStore.restore(power, wait_driver=True)
+    if ok:
+        print(f"Power: {power} — restored '{power}' state.")
+    else:
+        for e in errors:
+            print(f"Power: {power} — restore note: {e}")
+        # Seed first-boot state so next boot has something to restore.
+        if any("no saved state" in e for e in errors) and check_driver():
+            StateStore.save(power)
+
+
 # ── GUI Launch ─────────────────────────────────────────────────────────
 
 def launch_gui(selftest: bool = False):
@@ -1082,18 +1422,25 @@ APP_INSTALLABLE_PATHS = [
     "/etc/tmpfiles.d/linuwu_sense.conf",
     "/etc/udev/rules.d/99-predator-control.rules",
     "/etc/systemd/system/predator-permissions.service",
+    "/etc/systemd/system/predator-restore.service",
     "/etc/sudoers.d/predator-control",
+    "/var/lib/predator-control",
 ]
 
-SUDOERS_FILE = Path("/etc/sudoers.d/predator-control")
 _PRIV_ENV = "PREDATOR_ELEVATED"
-PRIV_COMMANDS = frozenset(["fans", "profile", "turbo", "battery"])
+PRIV_COMMANDS = frozenset(["fans", "profile", "turbo", "battery", "keyboard", "restore", "save", "on-ac-change"])
 
 
 def _needs_privilege(cmd: str, args) -> bool:
-    """True when a command writes hardware state and must run as root."""
+    """True when a command writes hardware/state and must run as root."""
     if cmd not in PRIV_COMMANDS:
         return False
+    if cmd in ("restore", "on-ac-change"):
+        return True
+    if cmd == "save":
+        return False  # state dir is group-writable; root not required
+    if cmd == "keyboard" and args and args[0] in ("--apply-mode", "--apply-zones"):
+        return True
     if not args:
         return False
     return args[0] not in ("status", "help")
@@ -1176,7 +1523,9 @@ def _print_uninstall_help():
           /etc/tmpfiles.d/linuwu_sense.conf
           /etc/udev/rules.d/99-predator-control.rules
           /etc/systemd/system/predator-permissions.service
+          /etc/systemd/system/predator-restore.service
           /etc/sudoers.d/predator-control
+          /var/lib/predator-control
 
         It does NOT touch linuwu_sense, the kernel module, or the
         linuwu_sense.service.
@@ -1216,12 +1565,12 @@ def cmd_uninstall(args):
         raise SystemExit(0)
 
     # Stop/disable our permissions service before deleting its unit file.
-    try:
-        subprocess.run(["sudo", "systemctl", "disable", "--now",
-                        "predator-permissions.service"],
-                       capture_output=True, text=True)
-    except (OSError, ValueError):
-        pass
+    for svc in ("predator-permissions.service", "predator-restore.service"):
+        try:
+            subprocess.run(["sudo", "systemctl", "disable", "--now", svc],
+                           capture_output=True, text=True)
+        except (OSError, ValueError):
+            pass
 
     ok, failures = _uninstall_paths(existing)
     if not ok:
@@ -1286,6 +1635,14 @@ def main():
     battery_p = sub.add_parser("battery", help="Battery controls")
     battery_p.add_argument("args", nargs="*")
 
+    save_p = sub.add_parser("save", help="Save current state for AC/battery persistence")
+    save_p.add_argument("args", nargs="*")
+
+    restore_p = sub.add_parser("restore", help="Restore saved AC/battery state")
+    restore_p.add_argument("args", nargs="*")
+
+    sub.add_parser("on-ac-change", help="Restore state for current power source (udev/boot)")
+
     keyboard_p = sub.add_parser("keyboard", help="Keyboard RGB controls")
     keyboard_p.add_argument("--selftest-qml", action="store_true",
                             help="Verify QML loads, then exit (no window)")
@@ -1312,9 +1669,15 @@ def main():
               keyboard   Keyboard RGB controls
               temps      Temperature telemetry
               status     Complete system status
+              save       Save current state (ac|battery|both|auto)
+              restore    Restore saved state (ac|battery|auto)
               self-test  Run hardware self-test
               uninstall  Uninstall this app (asks for sudo)
               help       Show help
+
+            Persistence: every successful write auto-saves for the
+              current power source (AC vs battery). Restored at boot
+              and on AC plug/unplug.
         """))
         return
 
@@ -1326,6 +1689,9 @@ def main():
         "keyboard": cmd_keyboard,
         "temps": cmd_temps,
         "status": cmd_status,
+        "save": cmd_save,
+        "restore": cmd_restore,
+        "on-ac-change": cmd_on_ac_change,
         "self-test": cmd_selftest,
         "uninstall": cmd_uninstall,
     }

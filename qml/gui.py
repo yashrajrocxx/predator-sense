@@ -22,7 +22,6 @@ from predator import (
     KeyboardController,
     KeyboardState,
     KB_EFFECTS,
-    KB_EFFECTS_BY_NAME,
 )
 
 
