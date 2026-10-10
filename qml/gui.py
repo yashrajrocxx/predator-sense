@@ -82,9 +82,22 @@ class KeyboardBridge(QObject):
 
     @Slot()
     def refresh(self):
-        self._state = KeyboardController.get_state()
-        self._zone_colors = list(self._state.per_zone.as_list())
-        self._zone_brightness = self._state.per_zone.brightness
+        try:
+            self._state = KeyboardController.get_state()
+        except (OSError, ValueError):
+            self._state = KeyboardState()
+            self._state.available = False
+        self._state.mode = max(0, min(self._state.mode, 7))
+        self._state.speed = max(0, min(self._state.speed, 9))
+        self._state.brightness = max(0, min(self._state.brightness, 100))
+        self._state.direction = max(0, min(self._state.direction, 2))
+        cleaned = [c if self._valid_hex(c) else "000000"
+                   for c in self._state.per_zone.as_list()]
+        self._zone_colors = cleaned
+        try:
+            self._zone_brightness = max(0, min(int(self._state.per_zone.brightness), 100))
+        except (TypeError, ValueError):
+            self._zone_brightness = 100
         self.modeChanged.emit()
         self.speedChanged.emit()
         self.brightnessChanged.emit()
@@ -97,74 +110,119 @@ class KeyboardBridge(QObject):
                 "Cannot read keyboard state. Are you in the 'linuwu_sense' group? "
                 "Log out and back in, then try again.", False)
 
+    @staticmethod
+    def _valid_hex(value: str) -> bool:
+        v = value.strip().lower().lstrip("#")
+        if len(v) != 6:
+            return False
+        try:
+            int(v, 16)
+        except ValueError:
+            return False
+        return True
+
     @Slot(int)
     def setMode(self, mode):
-        self._state.mode = max(0, min(mode, 7))
+        try:
+            self._state.mode = max(0, min(int(mode), 7))
+        except (TypeError, ValueError):
+            self.statusMessage.emit("Invalid effect mode.", False)
+            return
         self.modeChanged.emit()
 
     @Slot(int)
     def setSpeed(self, speed):
-        self._state.speed = max(0, min(speed, 9))
+        try:
+            self._state.speed = max(0, min(int(speed), 9))
+        except (TypeError, ValueError):
+            self.statusMessage.emit("Invalid effect speed.", False)
+            return
         self.speedChanged.emit()
 
     @Slot(int)
     def setBrightness(self, brightness):
-        self._state.brightness = max(0, min(brightness, 100))
+        try:
+            self._state.brightness = max(0, min(int(brightness), 100))
+        except (TypeError, ValueError):
+            self.statusMessage.emit("Invalid brightness.", False)
+            return
         self.brightnessChanged.emit()
 
     @Slot(int)
     def setDirection(self, direction):
-        self._state.direction = max(0, min(direction, 2))
+        try:
+            self._state.direction = max(0, min(int(direction), 2))
+        except (TypeError, ValueError):
+            self.statusMessage.emit("Invalid direction.", False)
+            return
         self.directionChanged.emit()
 
     @Slot(str)
     def setHexColor(self, color):
-        c = color.strip().lstrip("#")
-        if len(c) == 6:
-            try:
-                self._state.red = int(c[0:2], 16)
-                self._state.green = int(c[2:4], 16)
-                self._state.blue = int(c[4:6], 16)
-                self.colorChanged.emit()
-            except ValueError:
-                pass
+        if not isinstance(color, str) or not self._valid_hex(color):
+            self.statusMessage.emit("Invalid color (expected 6 hex digits).", False)
+            return
+        c = color.strip().lstrip("#").lower()
+        try:
+            self._state.red = int(c[0:2], 16)
+            self._state.green = int(c[2:4], 16)
+            self._state.blue = int(c[4:6], 16)
+            self.colorChanged.emit()
+        except ValueError:
+            self.statusMessage.emit("Invalid color (expected 6 hex digits).", False)
 
     @Slot(int, str)
     def setZoneColor(self, zone, color):
-        c = color.strip().lstrip("#")
-        if 0 <= zone < 4 and len(c) == 6:
-            try:
-                int(c, 16)
-                colors = list(self._zone_colors)
-                colors[zone] = c
-                self._zone_colors = colors
-                self.zoneColorsChanged.emit()
-            except ValueError:
-                pass
+        try:
+            zone = int(zone)
+        except (TypeError, ValueError):
+            self.statusMessage.emit("Invalid zone.", False)
+            return
+        if not 0 <= zone < 4:
+            self.statusMessage.emit("Invalid zone.", False)
+            return
+        if not isinstance(color, str) or not self._valid_hex(color):
+            self.statusMessage.emit("Invalid zone color (expected 6 hex digits).", False)
+            return
+        c = color.strip().lstrip("#").lower()
+        colors = list(self._zone_colors)
+        colors[zone] = c
+        self._zone_colors = colors
+        self.zoneColorsChanged.emit()
 
     @Slot(int)
     def setZoneBrightness(self, brightness):
-        self._zone_brightness = max(0, min(brightness, 100))
+        try:
+            self._zone_brightness = max(0, min(int(brightness), 100))
+        except (TypeError, ValueError):
+            self.statusMessage.emit("Invalid zone brightness.", False)
+            return
         self.zoneBrightnessChanged.emit()
 
     @Slot()
     def applyGlobalEffect(self):
         effect = KB_EFFECTS.get(self._state.mode, "Static")
-        ok, _ = KeyboardController.set_global_effect(
-            effect,
-            self._state.speed,
-            self._state.brightness,
-            self._state.direction,
-            self._state.hex_color,
-        )
+        try:
+            ok, _ = KeyboardController.set_global_effect(
+                effect,
+                self._state.speed,
+                self._state.brightness,
+                self._state.direction,
+                self._state.hex_color,
+            )
+        except (ValueError, OSError):
+            ok = False
         if not ok:
-            c = self._state.hex_color
-            ok = self._elevate([
-                str(APP_ROOT / "predator.py"), "keyboard", "--apply-mode",
-                str(self._state.mode), str(self._state.speed),
-                str(self._state.brightness), str(self._state.direction),
-                str(int(c[0:2], 16)), str(int(c[2:4], 16)), str(int(c[4:6], 16)),
-            ])
+            try:
+                c = self._state.hex_color
+                ok = self._elevate([
+                    str(APP_ROOT / "predator.py"), "keyboard", "--apply-mode",
+                    str(self._state.mode), str(self._state.speed),
+                    str(self._state.brightness), str(self._state.direction),
+                    str(int(c[0:2], 16)), str(int(c[2:4], 16)), str(int(c[4:6], 16)),
+                ])
+            except (ValueError, IndexError):
+                ok = False
         if ok:
             self.refresh()
             self.statusMessage.emit("Global effect applied.", True)
@@ -174,13 +232,16 @@ class KeyboardBridge(QObject):
 
     @Slot()
     def applyZoneColors(self):
-        ok, _ = KeyboardController.set_zone_colors(
-            self._zone_colors[0],
-            self._zone_colors[1],
-            self._zone_colors[2],
-            self._zone_colors[3],
-            self._zone_brightness,
-        )
+        try:
+            ok, _ = KeyboardController.set_zone_colors(
+                self._zone_colors[0],
+                self._zone_colors[1],
+                self._zone_colors[2],
+                self._zone_colors[3],
+                self._zone_brightness,
+            )
+        except (ValueError, OSError, IndexError):
+            ok = False
         if not ok:
             ok = self._elevate([
                 str(APP_ROOT / "predator.py"), "keyboard", "--apply-zones",
@@ -196,12 +257,12 @@ class KeyboardBridge(QObject):
                 "Failed to apply zone colors. Are you in the linuwu_sense group?", False)
 
     def _elevate(self, argv) -> bool:
-        """Retry a write as root via password-less sudo."""
+        """Retry a write as root via password-less sudo (never blocks the UI)."""
         try:
             r = subprocess.run(["sudo", "-n", *argv],
-                               capture_output=True, text=True,
+                               capture_output=True, text=True, timeout=15,
                                env={**os.environ, "PREDATOR_ELEVATED": "1"})
-        except FileNotFoundError:
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
             return False
         return r.returncode == 0
 
