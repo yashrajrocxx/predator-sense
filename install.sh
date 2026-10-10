@@ -14,11 +14,17 @@ TMPFILES_FILE="/etc/tmpfiles.d/predator-control.conf"
 DRIVER_BASE="/sys/module/linuwu_sense/drivers/platform:acer-wmi/acer-wmi"
 STAGED=""
 
-DIST="$(pwd)"
+DIST="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 say() { printf '\033[1;32m%s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m%s\033[0m\n' "$*" >&2; }
 die() { printf '\033[1;31mError: %s\033[0m\n' "$*" >&2; exit 1; }
+
+require_sudo() {
+    if ! sudo -v; then
+        die "sudo authentication failed (a terminal is required for the password prompt)."
+    fi
+}
 
 # ── Stage 1: hardware check ──────────────────────────────────────────
 check_hardware() {
@@ -170,9 +176,9 @@ setup_group() {
     fi
 
     local user
-    user=$(id -un)
+    user="${SUDO_USER:-$(id -un)}"
     if [[ -n "$user" && "$user" != "root" ]]; then
-        if ! groups "$user" | tr ' ' '\n' | grep -qx linuwu_sense; then
+        if ! id -nG "$user" 2>/dev/null | tr ' ' '\n' | grep -qx linuwu_sense; then
             warn "    Adding user '$user' to group 'linuwu_sense'"
             sudo usermod -aG linuwu_sense "$user"
             USER_GROUP_ADDED=1
@@ -350,6 +356,14 @@ verify() {
     [[ -x "$APP_DIR/predator.py" ]] || die "predator.py not executable in $APP_DIR"
     [[ -L "$BIN_LINK" && -e "$BIN_LINK" ]] || die "'predator' launcher not installed"
     [[ -f "$DESKTOP_FILE" ]] || warn "Desktop entry missing"
+    systemctl is-enabled predator-permissions.service >/dev/null 2>&1 \
+        || warn "predator-permissions.service is not enabled"
+    systemctl is-enabled predator-restore.service >/dev/null 2>&1 \
+        || warn "predator-restore.service is not enabled"
+    [[ -f /etc/udev/rules.d/99-predator-control.rules ]] \
+        || warn "udev rules missing"
+    sudo visudo -cf /etc/sudoers.d/predator-control >/dev/null 2>&1 \
+        || warn "sudoers rule failed validation"
 
     local fail=0
     python3 -c "import PySide6" >/dev/null 2>&1 || { warn "PySide6 import failed"; fail=1; }
@@ -357,7 +371,7 @@ verify() {
     echo ""
     say "CLI self-test:"
     local cmd
-    for cmd in help "fans status" "temps" "battery status" "profile status" "keyboard status" "status" "self-test"; do
+    for cmd in help "fans status" "temps" "battery status" "profile status" "keyboard status" "status" "save help" "restore help" "self-test"; do
         echo "--- predator $cmd ---"
         python3 "$APP_DIR/predator.py" $cmd 2>&1 || true
         echo ""
@@ -387,6 +401,7 @@ verify() {
 # ── main ─────────────────────────────────────────────────────────────
 main() {
     USER_GROUP_ADDED=0
+    require_sudo
     check_hardware
     check_driver
     install_packages

@@ -1726,6 +1726,14 @@ def cmd_uninstall(args):
             print_error(f"Failed to remove: {f}")
         raise SystemExit(1)
 
+    try:
+        subprocess.run(["sudo", "udevadm", "control", "--reload-rules"],
+                       capture_output=True, text=True)
+        subprocess.run(["sudo", "systemctl", "daemon-reload"],
+                       capture_output=True, text=True)
+    except (OSError, ValueError):
+        pass
+
     for p in existing:
         if not p.exists():
             print(f"  Removed: {p}")

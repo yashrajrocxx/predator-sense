@@ -34,26 +34,34 @@ ok()   { printf '✓ %s\n' "$*"; }
 warn() { printf '⚠ %s\n' "$*" >&2; }
 die()  { printf '✗ %s\n' "$*" >&2; exit 1; }
 
-cleanup_on_error() {
+cleanup_tmp=""
+cleanup_on_exit() {
     local rc=$?
+    if [[ -n "${cleanup_tmp:-}" ]]; then
+        rm -f "$cleanup_tmp" 2>/dev/null || true
+    fi
+    if [[ -n "${SUDO_KEEPALIVE_PID:-}" ]]; then
+        kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+    fi
     if (( rc != 0 )); then
-        printf '\n✗ Installer stopped (exit %d).\n' "$rc" >&2
-        printf 'The existing acer_wmi module was not permanently disabled by this script unless installation reached the configuration stage.\n' >&2
-        printf 'If the new module is loaded, it is safe to leave it loaded; otherwise reboot or run: sudo modprobe %s\n' "$CONFLICT" >&2
+        printf '\nInstaller stopped (exit %d).\n' "$rc" >&2
+        printf 'Boot persistence was written before hardware checks, so a reboot is safe.\n' >&2
+        printf 'If the new module is loaded, leave it loaded; otherwise run: sudo modprobe %s\n' "$CONFLICT" >&2
     fi
     exit "$rc"
 }
-trap cleanup_on_error EXIT
+trap cleanup_on_exit EXIT
 
 [[ $EUID -eq 0 ]] || true
 [[ $EUID -ne 0 ]] || die "Run this script as your normal user, not with sudo. The installer invokes sudo only where required."
 
-sudo -v
+if ! sudo -v; then
+    die "sudo authentication failed (a terminal is required for the password prompt)."
+fi
 
 # Keep sudo credentials alive while the script is running.
 ( while true; do sudo -n true; sleep 50; done ) 2>/dev/null &
 SUDO_KEEPALIVE_PID=$!
-trap 'kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true' EXIT
 
 log "Detecting hardware and kernel"
 vendor="$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || true)"
@@ -298,19 +306,23 @@ ok "State-restore service enabled and active"
 
 log "Configuring non-root permissions"
 if ! getent group "$MODULE" >/dev/null; then
-    sudo groupadd "$MODULE"
+    sudo groupadd -r "$MODULE"
     ok "Created group $MODULE"
 else
     ok "Group $MODULE already exists"
 fi
 
-sudo usermod -aG "$MODULE" "$USER"
+target_user="${SUDO_USER:-$USER}"
+if [[ -n "$target_user" && "$target_user" != "root" ]]; then
+    if ! id -nG "$target_user" 2>/dev/null | tr ' ' '\n' | grep -qx "$MODULE"; then
+        sudo usermod -aG "$MODULE" "$target_user"
+    fi
+fi
 
 # Rebuild the tmpfiles policy from scratch so stale entries cannot accumulate.
 # Use type 'z' (adjust mode/ownership). Type 'f' would try to create sysfs
 # files; type 'm' is invalid on systemd 261+ and silently ignored.
-tmp="$(mktemp)"
-trap 'rm -f "$tmp"; kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true' EXIT
+cleanup_tmp="$(mktemp -t predator-driver.XXXXXX)"
 
 {
     for f in backlight_timeout battery_calibration battery_limiter boot_animation_sound fan_speed lcd_override usb_charging; do
@@ -319,11 +331,12 @@ trap 'rm -f "$tmp"; kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true' EXIT
     printf 'z %s/four_zone_mode 0664 root %s -\n' "$KB_BASE" "$MODULE"
     printf 'z %s/per_zone_mode 0664 root %s -\n' "$KB_BASE" "$MODULE"
     printf 'z /sys/firmware/acpi/platform_profile 0664 root %s -\n' "$MODULE"
-} > "$tmp"
+} > "$cleanup_tmp"
 
-sudo install -m 644 "$tmp" "$TMPFILES_FILE"
-sudo systemd-tmpfiles --create "$TMPFILES_FILE"
-rm -f "$tmp"
+sudo install -m 644 "$cleanup_tmp" "$TMPFILES_FILE"
+sudo systemd-tmpfiles --create "$TMPFILES_FILE" || true
+rm -f "$cleanup_tmp"
+cleanup_tmp=""
 ok "Sysfs permissions configured for group $MODULE"
 
 log "Final verification"
